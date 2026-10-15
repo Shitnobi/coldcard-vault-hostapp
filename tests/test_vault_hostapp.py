@@ -118,7 +118,8 @@ def check_tree(outdir, mode, vout=0):
     try:
         vt.parse_psbt(bad)
         ok('output-map count enforced', vout == 0)
-    except Exception:
+    except (Exception, vt.HostappError):
+        # HostappError is SystemExit (BaseException), not Exception
         ok('output-map count enforced', vout == 1)
 
     # leaves: spend the deposit txid at vout `vout` (NOT always 0:
@@ -242,6 +243,194 @@ def test_exit_spk_shape(tmp, spk_v):
            man['cfg']['exit_spk'] == vp.p2wsh_spk(b'\x71' * 32).hex())
 
 
+def test_dup_key(tmp, policy, spk_v):
+    # HA-3 (audit #2): BIP-174 forbids duplicate keys within a map. A
+    # duplicated 0x01 witness-utxo key used to be read twice, inflating
+    # total_in and the built vault value (deposit paying out 2x the
+    # inputs). Must be refused.
+    ins = [(hashlib.sha256(b'fund:dupkey').digest(), 0, 0xFFFFFFFE)]
+    tx = vt.ser_tx(2, ins, [], 0)
+    wu = vt.ct_out(vp.p2wsh_spk(b'\x61' * 30), FUNDING_VALUE)
+    im = (vt.vi(1) + b'\x01' + vt.vi(len(wu)) + wu +
+          vt.vi(1) + b'\x01' + vt.vi(len(wu)) + wu +   # DUPLICATE key
+          b'\x00')
+    path = os.path.join(tmp, 'fund-dupkey.psbt')
+    open(path, 'wb').write(vt.build_psbt(tx, [im], 0))
+    try:
+        vt.parse_psbt(open(path, 'rb').read())
+        ok('duplicate map key refused (parser)', False)
+    except vt.HostappError as e:
+        ok('duplicate map key refused (parser)',
+           'duplicate key' in str(e) and 'BIP-174' in str(e))
+    r = run_app(policy, path, os.path.join(tmp, 'tree-dupkey'))
+    ok('duplicate map key refused (app)',
+       r.returncode != 0 and 'duplicate key' in (r.stdout + r.stderr) and
+       'Traceback' not in (r.stdout + r.stderr))
+
+
+def test_truncated(tmp, policy, spk_v):
+    # HA-2/HA-13 (audit #2): a truncated/malformed PSBT must be refused
+    # with a clean error (no traceback, no silent GUI death), even under
+    # 'python -O' (validation is not assert-based).
+    path = os.path.join(tmp, 'fund-trunc.psbt')
+    open(path, 'wb').write(b'psbt\xff' + vt.vi(1) + b'\x00' + vt.vi(3) +
+                           b'\x01\x02\x03' + b'\x00' + b'\x00')
+    r = run_app(policy, path, os.path.join(tmp, 'tree-trunc'))
+    ok('truncated PSBT refused cleanly',
+       r.returncode != 0 and 'Traceback' not in (r.stdout + r.stderr) and
+       'malformed PSBT' in (r.stdout + r.stderr))
+
+
+def test_dust(tmp, spk_v):
+    # HA-4 (audit #2): the device's W-04 check refuses to co-sign dust
+    # outputs (< 546 sats) at SPEND time. A ladder whose highest-fee
+    # leaf output is dust would enroll fine but be dead when needed -
+    # the host must refuse to build it. Also covers a dust vault value.
+    def small_funding(path, value):
+        ins = [(hashlib.sha256(b'fund:dust').digest(), 0, 0xFFFFFFFE)]
+        tx = vt.ser_tx(2, ins, [], 0)
+        wu = vt.ct_out(vp.p2wsh_spk(b'\x61' * 30), value)
+        im = vt.vi(1) + b'\x01' + vt.vi(len(wu)) + wu + b'\x00'
+        open(path, 'wb').write(vt.build_psbt(tx, [im], 0))
+        return path
+
+    # leaf ladder 500/600/700 on a 1000-sat vault -> outputs 500/400/300
+    fund = small_funding(os.path.join(tmp, 'fund-dust.psbt'), 1200)
+    pol = make_policy(tmp, name='policy-dust.json')
+    d = json.loads(open(pol).read())
+    d.update({'deposit_fee': 200, 'leaves': 3, 'emg_fee': 500,
+              'emg_step': 100})
+    open(pol, 'w').write(json.dumps(d))
+    r = run_app(pol, fund, os.path.join(tmp, 'tree-dust'))
+    ok('dust leaf ladder refused',
+       r.returncode != 0 and 'dust limit' in (r.stdout + r.stderr))
+
+    # dust vault value outright
+    fund2 = small_funding(os.path.join(tmp, 'fund-dust2.psbt'), 600)
+    r = run_app(pol, fund2, os.path.join(tmp, 'tree-dust2'))
+    ok('dust vault value refused',
+       r.returncode != 0 and 'dust limit' in (r.stdout + r.stderr))
+
+    # a sane ladder above the floor still builds
+    fund3 = small_funding(os.path.join(tmp, 'fund-ok.psbt'), 100000)
+    r = run_app(pol, fund3, os.path.join(tmp, 'tree-dustok'))
+    ok('above-dust ladder still builds', r.returncode == 0)
+
+
+def test_stale_outdir(tmp, policy, spk_v):
+    # HA-5 (audit #2): rebuilding with FEWER leaves into the same outdir
+    # used to leave the old emg3/emg4... files on disk - absent from the
+    # new manifest, uncovered by the new lattice root, but still
+    # policy-valid spends. The rebuild must clean them (and say so).
+    fund = make_funding(tmp, 'input-only', spk_v, 'fund-stale')
+    outdir = os.path.join(tmp, 'tree-stale')
+    r = run_app(policy, fund, outdir)                 # 5 leaves
+    ok('stale test: first build (5 leaves)', r.returncode == 0)
+    open(os.path.join(outdir, 'unrelated.txt'), 'w').write('keep me')
+    pol3 = make_policy(tmp, leaves=3, name='policy-3.json')
+    r = run_app(pol3, fund, outdir)                   # rebuild w/ 3
+    ok('stale test: rebuild (3 leaves)', r.returncode == 0)
+    man = json.loads(open(os.path.join(outdir, 'manifest.json')).read())
+    files = sorted(f for f in os.listdir(outdir) if f.endswith('.psbt'))
+    ok('stale emg leaves removed',
+       files == ['deposit.psbt', 'emg0.psbt', 'emg1.psbt', 'emg2.psbt']
+       and man['files'] == ['emg0.psbt', 'emg1.psbt', 'emg2.psbt'])
+    ok('unrelated files kept',
+       os.path.exists(os.path.join(outdir, 'unrelated.txt')))
+    ok('stale removal warned',
+       'stale' in (r.stdout + r.stderr))
+
+
+def test_min_relay_warning(tmp, spk_v):
+    # HA-7 (audit #2): in the modes where the host fixes the deposit
+    # fee, a fee below a conservative min-relay floor must at least be
+    # warned about (the signed deposit may not relay).
+    fund = make_funding(tmp, 'input-only', spk_v, 'fund-relay')
+    pol = make_policy(tmp, name='policy-relay.json')
+    d = json.loads(open(pol).read())
+    d['deposit_fee'] = 10                            # way below floor
+    open(pol, 'w').write(json.dumps(d))
+    r = run_app(pol, fund, os.path.join(tmp, 'tree-relay'))
+    ok('low deposit fee warned',
+       r.returncode == 0 and 'min-relay' in r.stdout)
+    # already-correct funding carries the funder's own fee: no warning
+    fund2 = make_funding(tmp, 'correct', spk_v, 'fund-relay2')
+    r = run_app(make_policy(tmp, name='policy-relay2.json'), fund2,
+                os.path.join(tmp, 'tree-relay2'))
+    ok('no min-relay warning when fee is the funder\'s',
+       r.returncode == 0 and 'min-relay' not in r.stdout)
+
+
+def test_marker_txid(tmp, policy, spk_v):
+    # HA-8 (audit #2): a non-compliant producer that leaves the witness
+    # marker/flag in the global tx must not corrupt the deposit txid
+    # (txid excludes marker/witness). The host commits to the clean
+    # serialization; leaves must spend the REAL outpoint.
+    ins = [(hashlib.sha256(b'fund:marker').digest(), 0, 0xFFFFFFFE)]
+    outs = [(spk_v, FUNDING_VALUE - DEPOSIT_FEE)]
+    clean = vt.ser_tx(2, ins, outs, 0)
+    raw = clean[:4] + b'\x00\x01' + clean[4:]        # marker + flag
+    wu = vt.ct_out(vp.p2wsh_spk(b'\x61' * 30), FUNDING_VALUE)
+    im = vt.vi(1) + b'\x01' + vt.vi(len(wu)) + wu + b'\x00'
+    path = os.path.join(tmp, 'fund-marker.psbt')
+    open(path, 'wb').write(vt.build_psbt(raw, [im], 1))
+    outdir = os.path.join(tmp, 'tree-marker')
+    r = run_app(policy, path, outdir)
+    ok('marker-tx funding accepted (cleaned)', r.returncode == 0)
+    if r.returncode == 0:
+        man = json.loads(open(os.path.join(outdir, 'manifest.json')).read())
+        ok('deposit txid is the CLEAN tx txid',
+           man['deposit_txid'] == vt.txid_of(clean)[::-1].hex())
+        dep = vt.parse_psbt(open(os.path.join(outdir, 'deposit.psbt'),
+                                 'rb').read())
+        ok('deposit global tx has no witness marker',
+           dep['tx'] == clean)
+        p = vt.parse_psbt(open(os.path.join(outdir, man['files'][0]),
+                               'rb').read())
+        _, pins, _, _ = vt.parse_tx(p['tx'])
+        ok('leaf spends the real (clean-txid) outpoint',
+           pins[0][0] == vt.txid_of(clean))
+
+
+def test_policy_validation(tmp, spk_v):
+    # HA-9 (audit #2): a malformed policy file must be refused with a
+    # clear message, not a KeyError/ValueError traceback.
+    fund = make_funding(tmp, 'input-only', spk_v, 'fund-badpol')
+    base = json.loads(open(make_policy(tmp, name='p-base.json')).read())
+
+    d = dict(base); del d['k3']
+    p1 = os.path.join(tmp, 'p-nok3.json'); open(p1, 'w').write(json.dumps(d))
+    r = run_app(p1, fund, os.path.join(tmp, 'tree-nok3'))
+    ok('missing policy field refused',
+       r.returncode != 0 and 'k3' in (r.stdout + r.stderr) and
+       'Traceback' not in (r.stdout + r.stderr))
+
+    d = dict(base); d['k2'] = 'zz' * 33
+    p2 = os.path.join(tmp, 'p-badhex.json'); open(p2, 'w').write(json.dumps(d))
+    r = run_app(p2, fund, os.path.join(tmp, 'tree-badhex'))
+    ok('non-hex policy key refused',
+       r.returncode != 0 and 'not valid hex' in (r.stdout + r.stderr))
+
+    d = dict(base); d['k2'] = base['k1']             # duplicate pubkey
+    p3 = os.path.join(tmp, 'p-dupkey.json'); open(p3, 'w').write(json.dumps(d))
+    r = run_app(p3, fund, os.path.join(tmp, 'tree-dupkeypol'))
+    ok('duplicate-pubkey policy refused (quorum collapse)',
+       r.returncode != 0 and 'quorum' in (r.stdout + r.stderr) and
+       'Traceback' not in (r.stdout + r.stderr))
+
+    d = dict(base); d['leaves'] = 20; d['emg_fee'] = 999; d['emg_step'] = 500
+    p4 = os.path.join(tmp, 'p-hifee.json'); open(p4, 'w').write(json.dumps(d))
+    r = run_app(p4, fund, os.path.join(tmp, 'tree-hifee'))
+    ok('leaf fee above f0_max refused at load',
+       r.returncode != 0 and 'f0_max' in (r.stdout + r.stderr))
+
+    open(os.path.join(tmp, 'p-notjson.json'), 'w').write('{nope')
+    r = run_app(os.path.join(tmp, 'p-notjson.json'), fund,
+                os.path.join(tmp, 'tree-notjson'))
+    ok('non-JSON policy refused',
+       r.returncode != 0 and 'not valid JSON' in (r.stdout + r.stderr))
+
+
 def main():
     tmp = tempfile.mkdtemp(prefix='vault-hostapp-')
     try:
@@ -291,6 +480,13 @@ def main():
         test_unknown_key(tmp, policy, spk_v)
         test_zero_pad(tmp, spk_v)
         test_exit_spk_shape(tmp, spk_v)
+        test_dup_key(tmp, policy, spk_v)
+        test_truncated(tmp, policy, spk_v)
+        test_dust(tmp, spk_v)
+        test_stale_outdir(tmp, policy, spk_v)
+        test_min_relay_warning(tmp, spk_v)
+        test_marker_txid(tmp, policy, spk_v)
+        test_policy_validation(tmp, spk_v)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 

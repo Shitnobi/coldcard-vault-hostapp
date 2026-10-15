@@ -169,7 +169,64 @@ try:
     ok('report: warning rendered first',
        gui.format_report(rep3).startswith('WARNING:'))
 
-    # ---- 7. GUI module imports headlessly --------------------------------------
+    # ---- 7. audit #2 regression checks (HA-1/2/4/5/10) ------------------------
+
+    # HA-1: duplicate pubkeys raise HostappError (was: bare
+    # VaultViolation that escaped every GUI error handler)
+    bad = good_fields(); bad['k2'] = bad['k1']
+    msg = hostapp_err(gui.policy_from_fields, bad)
+    ok('dup pubkeys -> HostappError (not VaultViolation)',
+       msg is not None and 'quorum' in msg)
+
+    # HA-2: a truncated PSBT through run_build raises HostappError (was:
+    # bare struct.error that killed the Tk callback silently)
+    trunc = (b'psbt\xff' + vt.vi(1) + b'\x00' + vt.vi(3) +
+             b'\x01\x02\x03' + b'\x00' + b'\x00')
+    msg = hostapp_err(gui.run_build, gui.policy_from_fields(good_fields()),
+                      trunc, os.path.join(tmp, 'out-trunc'))
+    ok('truncated PSBT -> HostappError (not struct.error)',
+       msg is not None and 'malformed' in msg)
+
+    # HA-3: duplicated witness-utxo key refused
+    wu2 = vt.ct_out(vp.p2wsh_spk(b'\x61' * 30), FUNDING_VALUE)
+    im2 = (vt.vi(1) + b'\x01' + vt.vi(len(wu2)) + wu2 +
+           vt.vi(1) + b'\x01' + vt.vi(len(wu2)) + wu2 + b'\x00')
+    dupblob = vt.build_psbt(
+        vt.ser_tx(2, [(b'\xaa' * 32, 0, 0xffffffff)], [], 0), [im2], 0)
+    msg = hostapp_err(gui.run_build, gui.policy_from_fields(good_fields()),
+                      dupblob, os.path.join(tmp, 'out-dup'))
+    ok('duplicate map key -> HostappError', msg is not None and
+       'duplicate key' in msg)
+
+    # HA-4: dust ladder refused through the GUI's exact build path
+    dust_tx = vt.ser_tx(2, [(b'\xab' * 32, 0, 0xffffffff)], [], 0)
+    dwu = vt.ct_out(vp.p2wsh_spk(b'\x61' * 30), 1200)
+    dim = vt.vi(1) + b'\x01' + vt.vi(len(dwu)) + dwu + b'\x00'
+    dustblob = vt.build_psbt(dust_tx, [dim], 0)
+    dusty = good_fields()
+    dusty.update({'deposit_fee': '200', 'leaves': '3', 'emg_fee': '500',
+                  'emg_step': '100'})
+    msg = hostapp_err(gui.run_build, gui.policy_from_fields(dusty),
+                      dustblob, os.path.join(tmp, 'out-dust'))
+    ok('dust ladder refused via run_build', msg is not None and
+       'dust limit' in msg)
+
+    # HA-5: stale leaves from a previous larger build are cleaned
+    so = os.path.join(tmp, 'out-stale')
+    gui.run_build(gui.policy_from_fields(good_fields()), blob, so)
+    smaller = good_fields(); smaller['leaves'] = '3'
+    rep_s = gui.run_build(gui.policy_from_fields(smaller), blob, so)
+    ok('stale emg leaves cleaned on rebuild',
+       sorted(f for f in os.listdir(so) if f.endswith('.psbt')) ==
+       ['deposit.psbt', 'emg0.psbt', 'emg1.psbt', 'emg2.psbt'])
+    ok('stale removal warned in report',
+       any('stale' in w for w in rep_s['warnings']))
+
+    # HA-10: JSON null renders as '' (was: the string 'None')
+    ok('fields_from_policy: None exit_spk -> empty',
+       gui.fields_from_policy({'exit_spk': None})['exit_spk'] == '')
+
+    # ---- 8. GUI module imports headlessly --------------------------------------
 
     ok('gui imports without tkinter (HAVE_TK flag)',
        hasattr(gui, 'HAVE_TK'))

@@ -57,6 +57,7 @@ class Widget:
     def clipboard_append(self, v): CLIPBOARD.append(v)
     def mainloop(self): pass
     def quit(self): pass
+    def update(self): pass
     def add_command(self, **kw): pass
     def add_cascade(self, **kw): pass
     def add_separator(self): pass
@@ -169,21 +170,57 @@ try:
         ok('copy root -> clipboard',
            CLIPBOARD and CLIPBOARD[-1] == app.report['lattice_root'])
 
-        # error path: break a field, rebuild -> error dialog, no crash
+        # error path: break a field, rebuild -> error dialog, no crash.
+        # HA-6 (audit #2): the previous build's results must be CLEARED,
+        # so a stale lattice root can never be copied by mistake.
         app.entries['n'].delete(0, 'end')
         app.entries['n'].insert(0, '99999')
         app.build()
         ok('bad field -> error dialog', len(ERRORS) == 1 and
            '65535' in ERRORS[0][1])
-        ok('previous report preserved on failure', app.report is not None)
+        ok('results cleared on failed rebuild', app.report is None and
+           'not built yet' in app.root_lbl.kw.get('text', ''))
+        ok('copy-root disabled on failed rebuild',
+           app.copy_root_btn.kw.get('state') == 'disabled')
 
-        # file-picker route: inject bytes as if a file was chosen
-        app.funding_bytes = blob
+        # HA-1 (audit #2): duplicate pubkeys used to raise a bare
+        # VaultViolation that escaped the GUI error handlers (silent
+        # Tk-callback death). Must now be a dialog.
         app.entries['n'].delete(0, 'end')
         app.entries['n'].insert(0, '1008')
+        app.entries['k2'].delete(0, 'end')
+        app.entries['k2'].insert(0, GOOD['k1'])
         app.build()
-        ok('file route builds too', len(ERRORS) == 1 and
-           app.report['lattice_count'] == 5)
+        ok('dup pubkeys -> error dialog (HA-1)', len(ERRORS) == 2 and
+           'quorum' in ERRORS[1][1])
+        app.entries['k2'].delete(0, 'end')
+        app.entries['k2'].insert(0, GOOD['k2'])
+
+        # HA-2 (audit #2): truncated pasted PSBT used to raise a bare
+        # struct.error (silent death). Must now be a dialog.
+        app.funding_bytes = None
+        app.paste_txt.delete('1.0', 'end')
+        app.paste_txt.insert('1.0', (b'psbt\xff' + vt.vi(1) + b'\x00' +
+                                     vt.vi(3) + b'\x01\x02\x03' + b'\x00' +
+                                     b'\x00').hex())
+        app.build()
+        ok('truncated PSBT -> error dialog (HA-2)', len(ERRORS) == 3 and
+           'malformed' in ERRORS[2][1])
+
+        # HA-11 (audit #2): both a file and pasted text set -> explicit
+        # refusal instead of silently preferring one
+        app.funding_bytes = blob
+        app.build()
+        ok('file + paste conflict -> error dialog',
+           len(ERRORS) == 4 and 'clear one' in ERRORS[3][1])
+        # ...and clearing the paste box resolves it (the picker clears
+        # the paste box; mirrored here)
+        app.paste_txt.delete('1.0', 'end')
+        app.build()
+        ok('file route builds too', len(ERRORS) == 4 and
+           app.report is not None and app.report['lattice_count'] == 5)
+        ok('copy-root re-enabled after successful rebuild',
+           app.copy_root_btn.kw.get('state') == 'normal')
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 

@@ -161,17 +161,25 @@ def policy_from_fields(fields):
             'highest emergency leaf fee (%d) exceeds Max fee F0 (%d)'
             % (pol['emg_fee'] + (pol['leaves'] - 1) * pol['emg_step'],
                pol['f0_max']))
-    # structural validation via the real rule layer (script shapes,
-    # N encoding): fails here rather than mid-build
-    vt.build_scripts(pol)
+    # structural validation via the real rule layer (script shapes, N
+    # encoding): fails here rather than mid-build. HA-1 (audit #2):
+    # VaultViolation (e.g. duplicate-pubkey quorum collapse) is wrapped
+    # as HostappError so the GUI error handlers can surface it.
+    try:
+        vt.build_scripts(pol)
+    except vp.VaultViolation as e:
+        raise vt.HostappError('policy refused: %s' % e)
     return pol
 
-
 def fields_from_policy(pol):
-    # pol dict (bytes keys / ints) -> {key: display string} for the GUI
+    # pol dict (bytes keys / ints) -> {key: display string} for the GUI.
+    # None (e.g. a JSON null exit_spk) renders as '', not 'None'
+    # (HA-10, audit #2: 'None' then failed hex validation on reload).
     out = {}
     for key, _label, _default, _kind in POLICY_FIELDS:
-        v = pol.get(key, '')
+        v = pol.get(key)
+        if v is None:
+            v = ''
         if isinstance(v, bytes):
             v = v.hex()
         out[key] = str(v)
@@ -248,11 +256,20 @@ def format_report(rep):
 def run_build(pol, funding, outdir):
     # the exact call the Build button makes (and what the headless
     # tests exercise): full vault tree build from a policy dict and
-    # funding PSBT bytes (or a file path)
-    return vt.build_tree(pol, funding, outdir,
-                         pol['deposit_fee'], pol['leaves'],
-                         pol['emg_fee'], pol['emg_step'])
-
+    # funding PSBT bytes (or a file path).
+    # HA-2 (audit #2): every non-Hostapp failure (struct.error from a
+    # truncated PSBT, VaultViolation, ...) is wrapped as HostappError so
+    # the GUI can never fail silently in a Tk callback.
+    try:
+        return vt.build_tree(pol, funding, outdir,
+                             pol['deposit_fee'], pol['leaves'],
+                             pol['emg_fee'], pol['emg_step'])
+    except vt.HostappError:
+        raise
+    except vp.VaultViolation as e:
+        raise vt.HostappError('policy refused: %s' % e)
+    except Exception as e:
+        raise vt.HostappError('build failed: %s' % e)
 
 # ---- the Tk application ----------------------------------------------------
 
@@ -357,7 +374,8 @@ class VaultApp:
                                   wraplength=640, font=('Courier', 10))
         self.root_lbl.pack(anchor='w')
         self.copy_root_btn = ttk.Button(res, text='Copy Lattice Root',
-                                        command=self.copy_root)
+                                        command=self.copy_root,
+                                        state='disabled')
         self.copy_root_btn.pack(anchor='w', pady=(4, 6))
         self.result_txt = scrolledtext.ScrolledText(res, height=10,
                                                     state='disabled',
@@ -425,6 +443,10 @@ class VaultApp:
             self.funding_bytes = blob
             self.fund_file_lbl.config(text=os.path.basename(fn),
                                       foreground='#050')
+            # HA-11 (audit #2): the file is now the funding source -
+            # clear the paste box so stale pasted text cannot shadow or
+            # conflict with it (see _funding).
+            self.paste_txt.delete('1.0', 'end')
             self._show_preview(blob)
         except (OSError, vt.HostappError) as e:
             self.funding_bytes = None
@@ -433,16 +455,31 @@ class VaultApp:
             messagebox.showerror(APP_TITLE, str(e))
 
     def _funding(self):
-        # funding PSBT bytes from the file picker, else the paste box
+        # funding PSBT bytes from the file picker, else the paste box.
+        # HA-11 (audit #2): if BOTH are set, refuse rather than silently
+        # prefer one - picking a file clears the paste box, so reaching
+        # this state means the user pasted after picking a file.
         if self.funding_bytes is not None:
+            if self.paste_txt.get('1.0', 'end').strip():
+                raise vt.HostappError(
+                    'both a funding FILE and pasted PSBT text are set; '
+                    'clear one (choosing a file empties the paste box)')
             return self.funding_bytes
         return decode_psbt_text(self.paste_txt.get('1.0', 'end'))
 
     def _show_preview(self, blob):
         p = preview_psbt(blob)
-        self.preview_lbl.config(
-            text='PSBT ok: %d input(s), %d output(s), funding value %d sats'
-                 % (p['inputs'], p['outputs'], p['value']))
+        if p['has_witness_utxos']:
+            self.preview_lbl.config(
+                text='PSBT ok: %d input(s), %d output(s), funding value '
+                     '%d sats' % (p['inputs'], p['outputs'], p['value']),
+                foreground='#050')
+        else:
+            # HA-11: say WHY the build would refuse, instead of
+            # showing a misleading 'funding value 0 sats'
+            self.preview_lbl.config(
+                text='PSBT parses, but has NO witness utxos - the build '
+                     'will refuse it', foreground='#a00')
 
     def preview(self):
         try:
@@ -454,6 +491,10 @@ class VaultApp:
         except (AssertionError, ValueError, IndexError) as e:
             self.preview_lbl.config(text='PSBT error: %s' % e,
                                     foreground='#a00')
+        except Exception as e:
+            # HA-2 (audit #2): never fail silently
+            self.preview_lbl.config(text='PSBT error: %s' % e,
+                                    foreground='#a00')
 
     def pick_outdir(self):
         d = filedialog.askdirectory(title='Choose output directory')
@@ -461,6 +502,10 @@ class VaultApp:
             self.outdir_var.set(d)
 
     def build(self):
+        # HA-6 (audit #2): clear the previous build's results FIRST - a
+        # failed rebuild must never leave a stale lattice root on screen
+        # (one click on Copy Lattice Root would copy the wrong root).
+        self._clear_results()
         try:
             pol = policy_from_fields(self._fields())
             funding = self._funding()
@@ -468,15 +513,28 @@ class VaultApp:
         except vt.HostappError as e:
             messagebox.showerror(APP_TITLE, str(e))
             return
-        except (AssertionError, ValueError, IndexError, OSError) as e:
+        except Exception as e:
+            # HA-2 (audit #2): belt-and-braces - a signing-infrastructure
+            # app must never fail silently in a Tk callback
             messagebox.showerror(APP_TITLE, 'build failed: %s' % e)
             return
         self.report = rep
         self.root_lbl.config(text='lattice root: %s' % rep['lattice_root'],
                              foreground='#050')
+        self.copy_root_btn.config(state='normal')
         self.result_txt.config(state='normal')
         self.result_txt.delete('1.0', 'end')
         self.result_txt.insert('1.0', format_report(rep))
+        self.result_txt.config(state='disabled')
+
+    def _clear_results(self):
+        # reset the results pane to the not-built state (see build)
+        self.report = None
+        self.root_lbl.config(text='lattice root: (not built yet)',
+                             foreground='')
+        self.copy_root_btn.config(state='disabled')
+        self.result_txt.config(state='normal')
+        self.result_txt.delete('1.0', 'end')
         self.result_txt.config(state='disabled')
 
     def copy_root(self):
@@ -484,6 +542,10 @@ class VaultApp:
             return
         self.root.clipboard_clear()
         self.root.clipboard_append(self.report['lattice_root'])
+        # HA-11 (audit #2): make the X server take ownership of the
+        # selection now, so the clipboard survives even if the app is
+        # closed immediately after copying
+        self.root.update()
 
     def about(self):
         messagebox.showinfo(

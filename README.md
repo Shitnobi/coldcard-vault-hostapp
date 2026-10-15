@@ -69,10 +69,10 @@ only; already-funded coins have N committed in their on-chain script.
 ## Tests
 
 ```sh
-python3 tests/test_vault_hostapp.py   # host app + CLI: 113 checks
-python3 tests/test_gui_logic.py       # GUI logic layer: 29 checks
-python3 tests/test_gui_smoke.py       # Tk app via mock tkinter: 15 checks
-python3 tests/test_gui_real.py        # REAL GUI (needs display): 17 checks
+python3 tests/test_vault_hostapp.py   # host app + CLI: 135 checks
+python3 tests/test_gui_logic.py       # GUI logic layer: 36 checks
+python3 tests/test_gui_smoke.py       # Tk app via mock tkinter: 20 checks
+python3 tests/test_gui_real.py        # REAL GUI (needs display): 21 checks
 ```
 
 `test_gui_real.py` SKIPs cleanly on headless machines. The full stack is
@@ -100,6 +100,49 @@ witness utxos chained to the deposit txid), re-derives the lattice
 root independently from the written PSBT files, and checks N
 push-encoding across the valid cadence range and refusal of
 ambiguous/insane funding.
+
+### Audit round 2 (all findings fixed, regression-tested)
+
+A second audit after the GUI work found and fixed:
+
+- **HA-1/HA-2 (GUI, silent failures)**: a duplicate-pubkey policy
+  raised a bare `VaultViolation` and a truncated PSBT a bare
+  `struct.error` — neither was in the GUI error handlers, so Build
+  died silently in the Tk callback with no dialog. Both are now
+  surfaced as dialogs (`run_build` wraps every failure as
+  `HostappError`).
+- **HA-3 (parser, BIP-174)**: duplicate keys within a PSBT map were
+  accepted — a duplicated `0x01` witness-utxo key double-counted
+  `total_in` and inflated the built vault value. Duplicate keys are
+  refused.
+- **HA-4 (fund availability)**: leaf ladders with outputs below the
+  dust limit (546 sats) were built and enrollable, but the device's
+  W-04 check refuses to co-sign dust — at spend time. The host now
+  refuses to build a dust vault or dust ladder up front.
+- **HA-5 (hygiene)**: rebuilding with fewer leaves into the same
+  output directory used to leave stale `emg*.psbt` files on disk
+  (absent from the manifest, uncovered by the lattice root, but still
+  valid spends). The rebuild now removes prior build artifacts and
+  warns.
+- **HA-6 (GUI)**: a failed rebuild kept the previous build's lattice
+  root on screen — one click could copy the wrong root at enrollment.
+  Results are now cleared (and Copy Lattice Root disabled) on
+  failure.
+- **HA-7**: a deposit fee below a conservative min-relay floor (in the
+  modes where the host fixes the fee) now draws a warning.
+- **HA-8**: the deposit txid is committed over the CLEAN transaction
+  serialization (a producer leaving a witness marker in the global tx
+  can no longer corrupt the txid the leaves spend).
+- **HA-9**: the CLI validates policy files with clear messages
+  instead of tracebacks.
+- **HA-10/HA-11 (GUI nits)**: JSON `null` fields, file-vs-paste
+  funding conflicts, missing-witness-utxo previews, and clipboard
+  persistence all handled.
+- **HA-13**: input validation is exception-based, not `assert`-based —
+  it survives `python -O`.
+
+Every fix has a red-first reproduction and a regression check in the
+test suites above.
 
 ## Provenance & sync
 

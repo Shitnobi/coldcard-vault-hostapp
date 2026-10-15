@@ -117,21 +117,56 @@ try:
         app.root.update()
         ok('bad field -> error dialog raised',
            len(captured_errors) == 1 and '65535' in captured_errors[0][1])
-        ok('previous report preserved on failed rebuild',
-           app.report is not None)
+        # HA-6 (audit #2): failed rebuild clears the stale results so a
+        # wrong root can never be copied
+        ok('results cleared on failed rebuild (real widgets)',
+           app.report is None and 'not built yet' in app.root_lbl.cget('text')
+           and app.copy_root_btn.instate(['disabled']))
 
-        # recover and build via the FILE funding route
+        # HA-1 (audit #2): duplicate pubkeys -> HostappError dialog (was
+        # a silent VaultViolation Tk-callback death on the real display)
         app.entries['n'].delete(0, 'end')
         app.entries['n'].insert(0, '1008')
+        k1_val = app.entries['k1'].get()
+        app.entries['k2'].delete(0, 'end')
+        app.entries['k2'].insert(0, k1_val)
+        app.build_btn.invoke()
+        app.root.update()
+        ok('dup pubkeys -> error dialog (real GUI)',
+           len(captured_errors) == 2 and 'quorum' in captured_errors[1][1])
+        ok('copy-root still disabled after second failure',
+           app.copy_root_btn.instate(['disabled']))
+
+        # HA-2 (audit #2): truncated pasted PSBT -> dialog (was a silent
+        # struct.error death)
+        app.entries['k2'].delete(0, 'end')
+        app.entries['k2'].insert(0, (b'\x03' + bytes(range(33, 65))).hex())
+        old_paste = app.paste_txt.get('1.0', 'end')
+        app.paste_txt.delete('1.0', 'end')
+        app.paste_txt.insert('1.0', (b'psbt\xff' + vt.vi(1) + b'\x00' +
+                                     vt.vi(3) + b'\x01\x02\x03' + b'\x00' +
+                                     b'\x00').hex())
+        app.build_btn.invoke()
+        app.root.update()
+        ok('truncated PSBT -> error dialog (real GUI)',
+           len(captured_errors) == 3 and 'malformed' in captured_errors[2][1])
+
+        # recover and build via the FILE funding route (the picker clears
+        # the paste box - mirrored here)
+        app.paste_txt.delete('1.0', 'end')
+        app.paste_txt.insert('1.0', old_paste)
         fn = os.path.join(tmp, 'f.psbt')
         open(fn, 'wb').write(blob)
         # simulate the picker: same state transitions it performs
         app.funding_bytes = blob
+        app.paste_txt.delete('1.0', 'end')
         app.fund_file_lbl.config(text=os.path.basename(fn))
         app.build_btn.invoke()
         app.root.update()
-        ok('file-route build via click', len(captured_errors) == 1 and
-           app.report['lattice_count'] == 5)
+        ok('file-route build via click', len(captured_errors) == 3 and
+           app.report is not None and app.report['lattice_count'] == 5)
+        ok('copy-root re-enabled (real widgets)',
+           app.copy_root_btn.instate(['!disabled']))
 
         # the mainloop path: schedule a quit and run it for real
         app.root.after(300, app.root.quit)
