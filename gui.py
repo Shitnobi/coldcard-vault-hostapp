@@ -332,8 +332,9 @@ class VaultApp:
         self.preview_lbl = ttk.Label(
             fund, text='', foreground='#050')
         self.preview_lbl.pack(anchor='w', pady=(4, 0))
-        ttk.Button(fund, text='Preview PSBT',
-                   command=self.preview).pack(anchor='w', pady=(4, 0))
+        self.preview_btn = ttk.Button(fund, text='Preview PSBT',
+                                      command=self.preview)
+        self.preview_btn.pack(anchor='w', pady=(4, 0))
 
         # --- output + build ---
         outrow = ttk.Frame(outer)
@@ -355,8 +356,9 @@ class VaultApp:
         self.root_lbl = ttk.Label(res, text='lattice root: (not built yet)',
                                   wraplength=640, font=('Courier', 10))
         self.root_lbl.pack(anchor='w')
-        ttk.Button(res, text='Copy Lattice Root',
-                   command=self.copy_root).pack(anchor='w', pady=(4, 6))
+        self.copy_root_btn = ttk.Button(res, text='Copy Lattice Root',
+                                        command=self.copy_root)
+        self.copy_root_btn.pack(anchor='w', pady=(4, 6))
         self.result_txt = scrolledtext.ScrolledText(res, height=10,
                                                     state='disabled',
                                                     font=('Courier', 9))

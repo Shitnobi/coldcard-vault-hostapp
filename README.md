@@ -72,7 +72,26 @@ only; already-funded coins have N committed in their on-chain script.
 python3 tests/test_vault_hostapp.py   # host app + CLI: 113 checks
 python3 tests/test_gui_logic.py       # GUI logic layer: 29 checks
 python3 tests/test_gui_smoke.py       # Tk app via mock tkinter: 15 checks
+python3 tests/test_gui_real.py        # REAL GUI (needs display): 17 checks
 ```
+
+`test_gui_real.py` SKIPs cleanly on headless machines. The full stack is
+also integration-tested against the real Coldcard simulator: a tree
+built through the GUI's code path runs enroll → lattice → signing gate →
+wipe inside `coldcard-mpy` (real firmware parser and policy) via
+`VAULT_E2E_DIR=<tree> unix/vault_sim_e2e.py` — which is how the leaf
+input-map bug below was caught.
+
+### Bug found by the device integration test
+
+Leaf PSBTs originally carried only the witness utxo. The Coldcard
+requires, on every vault input: the witness utxo (`0x01`), the witness
+script S_v (`0x05` — needed for script recognition and partial-signature
+verification), and the full non-witness UTXO (`0x00`, the deposit tx —
+needed for the P1 fee-window txid cross-check). Without these the
+device refuses to enroll the lattice. Fixed in `vault_tree.py`; lattice
+roots are unaffected (leaf hashes cover the unsigned tx, not the PSBT
+maps).
 
 Exercises the funding shapes (input-only, incorrect output,
 already-correct, vault output not at vout 0), verifies the built tree

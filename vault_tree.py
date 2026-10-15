@@ -339,7 +339,18 @@ def build_tree(pol, funding_path, outdir, deposit_fee, leaves,
         tx = ser_tx(version, [(dep_txid, vault_vout, SEQ_EMERGENCY)],
                     [(spk_e, vault_value - fee)], 0)
         wu = ct_out(spk_v, vault_value)
-        im = vi(1) + b'\x01' + vi(len(wu)) + wu + b'\x00'   # witness-utxo map
+        # The leaf input map must carry everything the Coldcard needs to
+        # verify + enroll the leaf (found by running a hostapp-built tree
+        # through the real device simulator):
+        #   0x01 witness utxo      - the vault coin (spk_v, vault_value)
+        #   0x05 witness script    - S_v itself (recognize() + partial-sig
+        #                            verification need the actual script)
+        #   0x00 full (non-witness) UTXO - the deposit tx, for the P1
+        #                            fee-window txid cross-check
+        im = (vi(1) + b'\x01' + vi(len(wu)) + wu +
+              vi(1) + b'\x05' + vi(len(s_v)) + s_v +
+              vi(1) + b'\x00' + vi(len(dep_tx)) + dep_tx +
+              b'\x00')
         name = 'emg%0*d.psbt' % (leaf_w, i)
         open(os.path.join(outdir, name), 'wb').write(
             build_psbt(tx, [im], 1))
