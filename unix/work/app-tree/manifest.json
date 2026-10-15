@@ -1,0 +1,57 @@
+{
+ "cfg": {
+  "n": 1008,
+  "sv_hash": "0020212f3f0b8d0349bb5bf2f5ee0ba50e47f5735c9fb73e9c949f5b61a184f57972",
+  "spk_e": "0020338b2c9529855c754cde188e03cef6f8deb4cffe0b6c2f459ebac43527261592",
+  "k1_pubkey": "020102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20",
+  "f0_max": 10000,
+  "exit_spk": "00205fb464a73396160a50f6963fc4fa8cf0c825b97490cc6ddd1547efa2507df9dd"
+ },
+ "lattice_root": "631821024c0462e44816298c1dcbb27f18dedf8d0f21929b4e739c8e9fd66137",
+ "lattice_count": 5,
+ "funding_mode": "input-only",
+ "funding_value": 100000,
+ "deposit_fee": 500,
+ "vault_value": 99500,
+ "vault_vout": 0,
+ "deposit_txid": "c67a1ae74db3eb5be2075330f9321997cb9ee3bb2f8b3741735f9d4e7fb6e631",
+ "files": [
+  "emg0.psbt",
+  "emg1.psbt",
+  "emg2.psbt",
+  "emg3.psbt",
+  "emg4.psbt"
+ ],
+ "expect": [
+  [
+   "emg0.psbt",
+   true,
+   "emergency",
+   "app-built emergency leaf"
+  ],
+  [
+   "emg1.psbt",
+   true,
+   "emergency",
+   "app-built emergency leaf"
+  ],
+  [
+   "emg2.psbt",
+   true,
+   "emergency",
+   "app-built emergency leaf"
+  ],
+  [
+   "emg3.psbt",
+   true,
+   "emergency",
+   "app-built emergency leaf"
+  ],
+  [
+   "emg4.psbt",
+   true,
+   "emergency",
+   "app-built emergency leaf"
+  ]
+ ]
+}
