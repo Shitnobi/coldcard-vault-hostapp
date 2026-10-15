@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 # (c) Copyright 2026 for the vault co-sign policy work; license per COPYING-CC.
 #
-# hostapp/vault_tree.py - very basic host side of the vault protocol.
+# vault_tree.py - the host side of the vault protocol (CLI; see gui.py
+# for the graphical front end).
 #
 # Accepts a FUNDING PSBT in one of three shapes:
 #   1. "just the input": one or more inputs (witness utxos) and no outputs
@@ -20,8 +21,8 @@
 # shared/vault_policy.py so host and device agree by construction.
 #
 # Usage:
-#   python3 hostapp/vault_tree.py init-policy policy.json
-#   python3 hostapp/vault_tree.py build policy.json funding.psbt outdir/
+#   python3 vault_tree.py init-policy policy.json
+#   python3 vault_tree.py build policy.json funding.psbt outdir/
 #       [--deposit-fee 500] [--leaves 5] [--emg-fee 500] [--emg-step 13]
 
 import os, sys, json, hashlib, struct, argparse
@@ -35,6 +36,13 @@ sys.path.append(HERE)
 import vault_policy as vp
 
 SEQ_EMERGENCY = vp.SEQ_EMERGENCY
+
+
+class HostappError(SystemExit):
+    # Fatal, user-facing error. Subclasses SystemExit so the CLI keeps
+    # its exact historical behavior (message to stderr, exit code 1,
+    # 'except SystemExit' in tests) while the GUI can catch it.
+    pass
 
 
 # ---- minimal host-side PSBT / tx codec (BIP-174 v0, witness-utxo form) ---
@@ -183,7 +191,7 @@ def push_num(n):
     # NOTE: parse_vault_script requires a data push (not OP_1..OP_16), so
     # N <= 16 is intentionally encoded non-minimally.
     if not (1 <= n <= 0xFFFF):
-        raise SystemExit('ERROR: cadence N must be in 1..65535, got %d' % n)
+        raise HostappError('ERROR: cadence N must be in 1..65535, got %d' % n)
     payload = n.to_bytes((n.bit_length() + 7) // 8, 'little')
     if payload[-1] & 0x80:
         payload += b'\x00'        # keep the script-num positive
@@ -219,7 +227,7 @@ def cfg_from_policy(pol, s_v, s_e):
     if ex:
         b = bytes.fromhex(ex)
         if len(b) != 34 or b[:2] != b'\x00\x20':
-            raise SystemExit(
+            raise HostappError(
                 'ERROR: exit_spk must be a P2WSH scriptPubKey '
                 '(34 bytes: OP_0 PUSH32 <hash>), got %d-byte spk %s'
                 % (len(b), ex))
@@ -237,11 +245,16 @@ def cfg_from_policy(pol, s_v, s_e):
 
 # ---- the app ---------------------------------------------------------------
 
-def load_funding(path, spk_v, deposit_fee):
-    # Accept, classify and normalize the funding PSBT. Returns
-    # (mode, tx_bytes, in_maps, vault_value, total_in, vault_vout).
-    blob = open(path, 'rb').read()
+def load_funding(funding, spk_v, deposit_fee):
+    # Accept, classify and normalize the funding PSBT. `funding` is a
+    # file path (str) or the raw PSBT bytes (e.g. decoded from pasted
+    # hex/base64 by the GUI). Returns
+    # (mode, tx_bytes, in_maps, vault_value, total_in, vault_vout,
+    #  warnings) - warnings is a list of human-readable strings the
+    # caller (CLI print / GUI display) surfaces to the user.
+    blob = open(funding, 'rb').read() if isinstance(funding, str) else funding
     ps = parse_psbt(blob)
+    warnings = []
     assert ps['wutxos'], 'funding PSBT needs witness utxos'
     total_in = sum(v for _, v in ps['wutxos'])
     assert total_in > deposit_fee, 'funding value <= deposit fee'
@@ -257,14 +270,14 @@ def load_funding(path, spk_v, deposit_fee):
         if len(match) != 1:
             # ambiguous: only one output may pay S_v (which one is the
             # deposit?); refuse rather than guess
-            raise SystemExit('ERROR: %d outputs pay S_v (expected exactly '
-                             'one); ambiguous funding refused' % len(match))
+            raise HostappError('ERROR: %d outputs pay S_v (expected exactly '
+                               'one); ambiguous funding refused' % len(match))
         if outs[match[0]][1] != total_in - deposit_fee:
             mode = 'incorrect-output'
         elif sum(v for _, v in outs) > total_in:
-            raise SystemExit('ERROR: funding outputs (%d sats) exceed '
-                             'inputs (%d sats)' %
-                             (sum(v for _, v in outs), total_in))
+            raise HostappError('ERROR: funding outputs (%d sats) exceed '
+                               'inputs (%d sats)' %
+                               (sum(v for _, v in outs), total_in))
         else:
             mode = 'already-correct'
             vault_vout = match[0]
@@ -276,22 +289,28 @@ def load_funding(path, spk_v, deposit_fee):
         vault_value = outs[match[0]][1]
     else:
         if mode == 'incorrect-output':
-            print('WARNING: funding output does not pay S_v with value '
-                  'funding-fee; REPLACING all outputs (incl. any change) '
-                  'with the vault deposit')
+            warnings.append(
+                'funding output does not pay S_v with value '
+                'funding-fee; REPLACING all outputs (incl. any change) '
+                'with the vault deposit')
         vault_value = total_in - deposit_fee
         tx_bytes = ser_tx(version, ins, [(spk_v, vault_value)], locktime)
-    return mode, tx_bytes, ps['in_maps'], vault_value, total_in, vault_vout
+    return (mode, tx_bytes, ps['in_maps'], vault_value, total_in,
+            vault_vout, warnings)
 
 
 def build_tree(pol, funding_path, outdir, deposit_fee, leaves,
                emg_fee, emg_step):
+    # Build the full vault tree (deposit + emergency lattice + manifest)
+    # and return a report dict for the caller to render (CLI prints it,
+    # the GUI shows it in the results pane). `funding_path` is a file
+    # path or raw PSBT bytes.
     s_v, s_e = build_scripts(pol)
     spk_v, spk_e = vp.p2wsh_spk(s_v), vp.p2wsh_spk(s_e)
     cfg = cfg_from_policy(pol, s_v, s_e)
 
-    mode, dep_tx, in_maps, vault_value, total_in, vault_vout = load_funding(
-        funding_path, spk_v, deposit_fee)
+    (mode, dep_tx, in_maps, vault_value, total_in, vault_vout, warnings
+     ) = load_funding(funding_path, spk_v, deposit_fee)
 
     # deposit.psbt: funding -> S_v (input maps carried over verbatim; one
     # output map per output of the deposit tx)
@@ -348,20 +367,49 @@ def build_tree(pol, funding_path, outdir, deposit_fee, leaves,
     open(os.path.join(outdir, 'manifest.json'), 'w').write(
         json.dumps(manifest, indent=1))
 
-    print('funding mode:     %s' % mode)
-    print('funding value:    %d sats' % total_in)
+    return {
+        'warnings': warnings,
+        'funding_mode': mode,
+        'funding_value': total_in,
+        'vault_value': vault_value,
+        'deposit_fee': deposit_fee,
+        'vault_vout': vault_vout,
+        'deposit_txid': manifest['deposit_txid'],
+        'lattice_count': count,
+        'leaf_files': files,
+        'emg_fee': emg_fee,
+        'emg_step': emg_step,
+        'lattice_root': root.hex(),
+        'spk_v': spk_v.hex(),
+        'spk_e': spk_e.hex(),
+        'outdir': os.path.abspath(outdir),
+        'manifest_path': os.path.abspath(
+            os.path.join(outdir, 'manifest.json')),
+    }
+
+
+def print_report(rep):
+    # CLI rendering of a build_tree() report (same lines as the
+    # historical output, plus any funding warnings surfaced first)
+    for w in rep['warnings']:
+        print('WARNING: %s' % w)
+    print('funding mode:     %s' % rep['funding_mode'])
+    print('funding value:    %d sats' % rep['funding_value'])
     print('vault value:      %d sats (deposit fee %d)' %
-          (vault_value, deposit_fee))
-    print('vault vout:       %d' % vault_vout)
-    print('deposit txid:     %s' % manifest['deposit_txid'])
+          (rep['vault_value'], rep['deposit_fee']))
+    print('vault vout:       %d' % rep['vault_vout'])
+    print('deposit txid:     %s' % rep['deposit_txid'])
     print('lattice:          %d emergency leaves, fees %d..%d' %
-          (count, emg_fee, emg_fee + (leaves - 1) * emg_step))
+          (rep['lattice_count'], rep['emg_fee'],
+           rep['emg_fee'] + (len(rep['leaf_files']) - 1) * rep['emg_step']))
+    leaf_w = len(str(len(rep['leaf_files']) - 1)) \
+        if len(rep['leaf_files']) > 1 else 1
     print('leaf files:       emg%0*d.psbt .. emg%0*d.psbt (fixed width: '
           'file-picker sort order == leaf order; ENROLL IN THAT ORDER)'
-          % (leaf_w, 0, leaf_w, leaves - 1))
-    print('lattice root:     %s' % root.hex())
+          % (leaf_w, 0, leaf_w, len(rep['leaf_files']) - 1))
+    print('lattice root:     %s' % rep['lattice_root'])
     print('wrote %d emg PSBTs + deposit.psbt + manifest.json to %s' %
-          (count, outdir))
+          (rep['lattice_count'], rep['outdir']))
 
 
 def init_policy(path, random_keys):
@@ -421,13 +469,13 @@ def main():
         init_policy(a.path, a.random_keys)
         return
     pol = load_policy(a.policy)
-    build_tree(pol, a.funding, a.outdir,
+    print_report(build_tree(pol, a.funding, a.outdir,
                a.deposit_fee if a.deposit_fee is not None
                else pol.get('deposit_fee', 500),
                a.leaves if a.leaves is not None else pol.get('leaves', 5),
                a.emg_fee if a.emg_fee is not None else pol.get('emg_fee', 500),
                a.emg_step if a.emg_step is not None
-               else pol.get('emg_step', 13))
+               else pol.get('emg_step', 13)))
 
 
 if __name__ == '__main__':

@@ -22,6 +22,33 @@ vault deposit on an ordinary computer — no device firmware required:
 
 ## Usage
 
+### Graphical (recommended)
+
+```sh
+python3 gui.py
+```
+
+- **Vault Policy** — create a new policy (demo or random keys), load or
+  save a policy JSON, and edit every field: co-sign keys K1/K2/K3,
+  cadence N, max fee F0, lattice size and fees, optional exit
+  destination. Fields are validated live against the same rule layer
+  the Coldcard runs.
+- **Funding PSBT** — accept a funding PSBT two ways: **Choose PSBT
+  file...** (picker) or paste the PSBT as **hex or base64** text.
+  *Preview PSBT* parses it and shows input/output counts and funding
+  value before you commit.
+- **Build Vault Tree** — runs the full build and renders the report:
+  funding mode, vault value, deposit txid, leaf files, and the
+  **lattice root** with a one-click *Copy Lattice Root* button (compare
+  it against the Coldcard screen at enrollment).
+- Warnings (e.g. a funding output that will be replaced) and errors are
+  surfaced in dialogs / the results pane.
+
+tkinter is in the Python standard library; on Debian/Ubuntu:
+`sudo apt install python3-tk`.
+
+### Command line
+
 ```sh
 # 1. create a policy file (edit it: keys, cadence n, fee window)
 python3 vault_tree.py init-policy policy.json
@@ -42,7 +69,9 @@ only; already-funded coins have N committed in their on-chain script.
 ## Tests
 
 ```sh
-python3 tests/test_vault_hostapp.py
+python3 tests/test_vault_hostapp.py   # host app + CLI: 113 checks
+python3 tests/test_gui_logic.py       # GUI logic layer: 29 checks
+python3 tests/test_gui_smoke.py       # Tk app via mock tkinter: 15 checks
 ```
 
 Exercises the funding shapes (input-only, incorrect output,
